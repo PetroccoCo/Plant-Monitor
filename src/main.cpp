@@ -1,184 +1,160 @@
-/* ESP8266 Moisture Sensor
-   This sketch uses an ESP8266 to read the analog signal from a moisture sensor. The data is then displayed
-   using the serial console or a web browser. Based on the moisture reading, the ESP8266 will blink a RGB LED
-   red, green or blue.
-
-   Red = Dry
-   Green = In between Wet and Dry
-   Blue = Wet
-
-     Viewing the data via web browser by going to the ip address. In this sketch the address is
-     http://192.168.1.221
-
-      The browser data includes a Google Chart to visually illustrate the moisture reading as a guage.
-
-   ///////////////////////////////////////
-   Arduino IDE Setup
-   File:
-      Preferences
-        Add the following link to the "Additional Boards Manager URLs" field: 
-        http://arduino.esp8266.com/stable/package_esp8266com_index.json
-   Tools:
-      board: NodeMCU 1.0 (ESP-12 Module)
-      programmer: USBtinyISP
-
-      
-  ///////////////////////////////
-*/
+#include <Arduino.h>
+#include <NTPClient.h>
 #include <ESP8266WiFi.h>
+#include <WiFiUdp.h>
+#include <FastCRC.h>
 #include "wifi.h"
+#include <ArduinoOTA.h>
 
-/*
-const int redPin = 4; //  ~D2
-const int greenPin = 12; // ~D6
-const int bluePin = 14; // ~D5
-*/
+bool printRTCData(ushort offset);
+uint8_t getRTCData(ushort offset);
+void writeRTCData(ushort offset);
+ushort findOldestOffset();
 
-int WiFiStrength = 0;
+struct MoistureData
+{
+  uint8_t crc8;
+  ulong timeStamp;
+  u_char moistureVal;
+} rtcData;
 
 WiFiServer server(80);
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP);
 
-void setup() {
+FastCRC8 CRC8;
+
+ushort currentOffset;
+
+void setup()
+{
   Serial.begin(115200);
-  delay(10);
-
-/*
-  pinMode(redPin, OUTPUT);
-  pinMode(greenPin, OUTPUT);
-  pinMode(bluePin, OUTPUT);
-
-
-  // color while waiting to connect
-  analogWrite(redPin, 280);
-  analogWrite(greenPin, 300);
-  analogWrite(bluePin, 300);
-*/
-
-  // Connect to WiFi network
   Serial.println();
-  Serial.println();
-  Serial.print("Connecting to ");
-  Serial.println(SSID);
 
+  // give everything a second to settle
+  delay(1000);
   WiFi.begin(SSID, PSK);
-
-  // Set the ip address of the webserver
-  // WiFi.config(WebServerIP, Gatway, Subnet)
-  // or comment out the line below and DHCP will be used to obtain an IP address
-  // which will be displayed via the serial console
-
-  // WiFi.config(IPAddress(192, 168, 1, 221), IPAddress(192, 168, 1, 1), IPAddress(255, 255, 255, 0));
-
-  // connect to WiFi router
-  while (WiFi.status() != WL_CONNECTED) {
+  while (WiFi.status() != WL_CONNECTED)
+  {
     delay(500);
     Serial.print(".");
   }
-
-  Serial.println("");
-  Serial.println("WiFi connected");
-
-  // Start the server
+  Serial.println(WiFi.localIP());
   server.begin();
-  Serial.println("Server started");
 
-  // Print the IP address
-  Serial.print("Use this URL to connect: ");
-  Serial.print("http://");
-  Serial.print(WiFi.localIP());
-  Serial.println("/");
+  timeClient.begin();
+  timeClient.update();
 
+  ushort startingOffset = findOldestOffset();
+  Serial.printf("Oldest offset is %u \n", startingOffset);
+
+  writeRTCData(startingOffset);
+  currentOffset = startingOffset;
+
+  ArduinoOTA.setPort(3232);
+  ArduinoOTA.begin();
+  ArduinoOTA.setRebootOnSuccess(true);
+  //Serial.println("Going into deep sleep for 60 minutes");
+  //deep sleep is micro seconds, one second is 1e6
+  //ESP.deepSleep(36e8);
 }
 
-double analogValue = 0.0;
-double analogVolts = 0.0;
-unsigned long timeHolder = 0;
+/* iterate by 2 as our data struct is 8 bytes and offsets are at 4 byte boundries */
+ushort findOldestOffset()
+{
+  ushort oldOffset = 0;
+  ulong oldTime = timeClient.getEpochTime();
+  for (short curOffset = 0; curOffset < 128; curOffset = curOffset + 2)
+  {
+    uint8_t crc8 = getRTCData(curOffset);
+    if (crc8 == rtcData.crc8)
+    {
+      if (oldTime > rtcData.timeStamp)
+      {
+        oldTime = rtcData.timeStamp;
+        oldOffset = curOffset;
+      }
+    }
+    else
+    {
+      // invalid checksum just start here
+      return curOffset;
+    }
+  }
+  return oldOffset;
+}
 
+bool printRTCData(ushort offset)
+{
+  Serial.printf("Reading block %u \n", offset);
+  if (ESP.rtcUserMemoryRead(offset, (uint32_t *)&rtcData, sizeof(rtcData)))
+  {
+    Serial.println("Read: ");
+    uint8_t crcOfData = CRC8.smbus((uint8_t *)&rtcData.timeStamp, sizeof(rtcData.timeStamp));
+    Serial.print("CRC8 of data: ");
+    Serial.println(crcOfData, HEX);
+    Serial.print("CRC8 read from RTC: ");
+    Serial.println(rtcData.crc8, HEX);
+    Serial.printf("Moisture was %u at time %lu \n", rtcData.moistureVal, rtcData.timeStamp);
+    return rtcData.crc8 == crcOfData;
+  }
+  return false;
+}
+
+uint8_t getRTCData(ushort offset)
+{
+  if (ESP.rtcUserMemoryRead(offset, (uint32_t *)&rtcData, sizeof(rtcData)))
+  {
+    return CRC8.smbus((uint8_t *)&rtcData.timeStamp, sizeof(rtcData.timeStamp));
+  }
+  return 0;
+}
+
+void writeRTCData(ushort offset)
+{
+  // Generate new data set for the struct
+  timeClient.update();
+  rtcData.timeStamp = timeClient.getEpochTime();
+  Serial.println(timeClient.getEpochTime());
+
+  double analogValue = 0.0;
+  //double analogVolts = 0.0;
+
+  analogValue = analogRead(A0); // read the analog signal
+  //analogVolts = (analogValue * 3.3) / 1024;
+
+  // 900 is totally dry in air
+  // 400 is sitting in water
+
+  ushort chartValue = (1 - 1 / (500 / (analogValue - 400))) * 100;
+  rtcData.moistureVal = chartValue;
+  Serial.printf("Moisture value is: %u \n", chartValue);
+
+  uint8_t crcOfData = CRC8.smbus((uint8_t *)&rtcData.timeStamp, sizeof(rtcData.timeStamp));
+  Serial.print("CRC8 of data: ");
+  Serial.println(crcOfData, HEX);
+  rtcData.crc8 = crcOfData;
+
+  if (ESP.rtcUserMemoryWrite(offset, (uint32_t *)&rtcData, sizeof(rtcData)))
+  {
+    Serial.println("RTC data written");
+    Serial.println();
+    printRTCData(offset);
+  }
+}
 
 void loop() {
+  
+  ArduinoOTA.handle();
 
-  WiFiStrength = WiFi.RSSI(); // get dBm from the ESP8266
-  analogValue = analogRead(A0); // read the analog signal
-
-  // convert the analog signal to voltage
-  // the ESP2866 A0 reads between 0 and ~3 volts, producing a corresponding value
-  // between 0 and 1024. The equation below will convert the value to a voltage value.
-
-
-  analogVolts = (analogValue * 3.3) / 1024;
-
-  // now get our chart value by converting the analog (0-1024) value to a value between 0 and 100.
-  // the value of 400 was determined by using a dry moisture sensor (not in soil, just in air).
-  // When dry, the moisture sensor value was approximately 400. This value might need adjustment
-  // for fine tuning of the chartValue.
-
-// 900 is totally dry in air
-// 400 is sitting in water
-
-  int chartValue = (1 - 1 / (500 / (analogValue - 400))) * 100;
-
-  // set a "blink" time interval in milliseconds.
-  // for example, 15000 is 15 seconds. However, the blink will not always be 15 seconds due to other
-  // delays set in the code.
-/*
-  if (millis() - 15000 > timeHolder)
-  {
-    timeHolder = millis();
-
-    // determine which color to use with the LED based on the chartValue.
-    // note: PWM is used so any color combo desired can be set by changing the values sent to each pin
-    // between 0 and 1024 - 0 being OFF and 1024 being full power
-    ////   yellowish
-    //  analogWrite(redPin, 900);
-    //  analogWrite(greenPin, 1010);
-    //  analogWrite(bluePin, 100);
-
-    if (chartValue <= 25) {  // 0-25 is red "dry"
-
-      analogWrite(redPin, 1000);
-      analogWrite(greenPin, 0);
-      analogWrite(bluePin, 0);
-
-    } else if (chartValue > 25 && chartValue <= 75) // 26-75 is green
-    {
-
-      analogWrite(redPin, 0);
-      analogWrite(greenPin, 1000);
-      analogWrite(bluePin, 0);
-
+  ulong oneHourLater = 3600 + rtcData.timeStamp;
+  if(timeClient.getEpochTime() > oneHourLater) {
+    currentOffset = currentOffset + 2;  
+    if(currentOffset > 128){
+      currentOffset = 0;
     }
-    else if (chartValue > 75 ) // 76-100 is blue
-    {
-
-      analogWrite(redPin, 0);
-      analogWrite(greenPin, 0);
-      analogWrite(bluePin, 1000);
-
-    }
-
-    delay(1000); // this is the duration the LED will stay ON
-
-    analogWrite(redPin, 0);
-    analogWrite(greenPin, 0);
-    analogWrite(bluePin, 0);
-
+    writeRTCData(currentOffset);
   }
-*/
-  // Serial data
-  Serial.print("Analog raw: ");
-  Serial.println(analogValue);
-  Serial.print("Analog V: ");
-  Serial.println(analogVolts);
-  Serial.print("ChartValue: ");
-  Serial.println(chartValue);
-  Serial.print("TimeHolder: ");
-  Serial.println(timeHolder);
-  Serial.print("millis(): ");
-  Serial.println(millis());
-  Serial.print("WiFi Strength: ");
-  Serial.print(WiFiStrength); Serial.println("dBm");
-  Serial.println(" ");
-  delay(1000); // slows amount of data sent via serial
 
   // check to for any web server requests. ie - browser requesting a page from the webserver
   WiFiClient client = server.available();
@@ -212,7 +188,7 @@ void loop() {
   client.println("      var data = google.visualization.arrayToDataTable([ ");
   client.println("        ['Label', 'Value'], ");
   client.print("        ['Moisture',  ");
-  client.print(chartValue);
+  client.print(rtcData.moistureVal);
   client.println(" ], ");
   client.println("       ]); ");
   // setup the google chart options here
@@ -230,7 +206,7 @@ void loop() {
 
   client.println("  setInterval(function() {");
   client.print("  data.setValue(0, 1, ");
-  client.print(chartValue);
+  client.print(rtcData.moistureVal);
   client.println("    );");
   client.println("    chart.draw(data, options);");
   client.println("    }, 13000);");
@@ -248,12 +224,6 @@ void loop() {
   client.println("<table><tr><td>");
 
   client.print("WiFi Signal Strength: ");
-  client.println(WiFiStrength);
-  client.println("dBm<br>");
-  client.print("Analog Raw: ");
-  client.println(analogValue);
-  client.print("<br>Analog Volts: ");
-  client.println(analogVolts);
   client.println("<br><a href=\"/REFRESH\"\"><button>Refresh</button></a>");
 
   client.println("</td><td>");
@@ -261,9 +231,20 @@ void loop() {
   client.println("<div id=\"chart_div\" style=\"width: 300px; height: 120px;\"></div>");
   client.println("</td></tr></table>");
 
+  client.println("<br /><table><tr><th>Timestamp</th><th>Moisture level</th><th>CRC8 in Mem</th><th>CRC8 Computed</th></tr>");
+  for (short curOffset = 0; curOffset < 128; curOffset = curOffset + 2)
+  {
+    uint8_t crc8 = getRTCData(curOffset);
+    time_t rawtime;
+    rawtime = rtcData.timeStamp;
+    client.printf("<tr><td>%s</td><td>%u</td><td>%X</td><td>%X</td></tr>\n", ctime(&rawtime), rtcData.moistureVal, rtcData.crc8, crc8);
+  }
+  client.println("</table>");
+
   client.println("<body>");
   client.println("</html>");
   delay(1);
   Serial.println("Client disonnected");
   Serial.println("");
+
 }
